@@ -34,7 +34,7 @@ static cudaStream_t streams[NGPU];
 static float *A_gpu[NGPU], *B_gpu[NGPU], *C_gpu[NGPU];
 
 
-void matmul(const float *A, const float *B, float *C, int M, int N, int K) {
+void matmul(float *A, float *B, float *C, int M, int N, int K) {
 
   if (mpi_rank != 0) return; // FIXME
 
