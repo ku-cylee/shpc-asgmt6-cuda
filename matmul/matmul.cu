@@ -14,16 +14,36 @@
     }                                                                 \
   } while (0)
 
+#define TILE_SIZE     32
+
 static int mpi_rank, mpi_world_size;
 
 static __global__ void matmul_kernel(float *A, float *B, float *C, int M, int N,
                                      int K) {
-  int j = blockDim.x * blockIdx.x + threadIdx.x;
-  int i = blockDim.y * blockIdx.y + threadIdx.y;
-  if (i >= M || j >= N) return;
-  float sum = 0.0;
-  for (int k = 0; k < K; ++k) sum += A[i * K + k] * B[k * N + j];
-  C[i * N + j] = sum;
+  int local_row = threadIdx.y;
+  int local_col = threadIdx.x;
+
+  int global_row = TILE_SIZE * blockIdx.y + local_row;
+  int global_col = TILE_SIZE * blockIdx.x + local_col;
+
+  __shared__ float A_tile[TILE_SIZE][TILE_SIZE];
+  __shared__ float B_tile[TILE_SIZE][TILE_SIZE];
+
+  float sum = 0.0f;
+  for (int k = 0; k < K; k += TILE_SIZE) {
+    A_tile[local_row][local_col] = A[global_row * K + local_col + k];
+    B_tile[local_row][local_col] = B[(local_row + k) * N + global_col];
+
+    __syncthreads();
+
+    for (int t = 0; t < TILE_SIZE; t++) {
+      sum += A_tile[local_row][t] * B_tile[t][local_col];
+    }
+
+    __syncthreads();
+  }
+
+  C[global_row * N + global_col] = sum;
 }
 
 #define NGPU 4
@@ -57,8 +77,8 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
   // Run kernels asynchronously on each GPU
   for (int i = 0; i < ngpu; i++) {
     CHECK_CUDA(cudaSetDevice(i));
-    dim3 blockDim(16, 16);
-    dim3 gridDim((N + 16 - 1) / 16, (Mend[i] - Mbegin[i] + 16 - 1) / 16);
+    dim3 blockDim(TILE_SIZE, TILE_SIZE);
+    dim3 gridDim((N + TILE_SIZE - 1) / TILE_SIZE, (Mend[i] - Mbegin[i] + TILE_SIZE - 1) / TILE_SIZE);
     matmul_kernel<<<gridDim, blockDim, 0, streams[i]>>>(
         A_gpu[i], B_gpu[i], C_gpu[i], Mend[i] - Mbegin[i], N, K);
     CHECK_CUDA(cudaGetLastError());
