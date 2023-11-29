@@ -36,7 +36,13 @@ static float *A_gpu[NGPU], *B_gpu[NGPU], *C_gpu[NGPU];
 
 void matmul(float *A, float *B, float *C, int M, int N, int K) {
 
-  if (mpi_rank != 0) return; // FIXME
+  int M_per_node = M / mpi_world_size;
+
+  MPI_Scatter(
+    A, M_per_node * K, MPI_FLOAT,
+    A, M_per_node * K, MPI_FLOAT,
+    0, MPI_COMM_WORLD);
+  MPI_Bcast(B, K * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
   // Async memcpy H->D on each GPU
   for (int i = 0; i < ngpu; i++) {
@@ -71,6 +77,11 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
     cudaSetDevice(i);
     cudaStreamSynchronize(streams[i]);
   }
+
+  MPI_Gather(
+    C, M_per_node * N, MPI_FLOAT,
+    C, M_per_node * N, MPI_FLOAT,
+    0, MPI_COMM_WORLD);
 }
 
 
@@ -81,16 +92,19 @@ void matmul_initialize(int M, int N, int K) {
   CHECK_CUDA(cudaGetDeviceCount(&ngpu));
 
   printf("[rank %d] Number of devices: %d\n", mpi_rank, ngpu);
-  cudaDeviceProp props[4];
+  cudaDeviceProp props[NGPU];
   for (int i = 0; i < ngpu; ++i) {
     CHECK_CUDA(cudaGetDeviceProperties(&props[i], i));
     printf("[rank %d] device %d: %s\n", mpi_rank, i, props[i].name);
   }
 
+  int M_per_node = M / mpi_world_size;
+  int M_per_gpu = M_per_node / ngpu;
+
   for (int i = 0; i < ngpu; i++) {
-    Mbegin[i] = M / ngpu * i;
-    Mend[i] = M / ngpu * (i + 1);
-    if (i == ngpu - 1) Mend[i] = M;
+    Mbegin[i] = M_per_gpu * i;
+    Mend[i] = Mbegin[i] + M_per_gpu;
+    if (i == ngpu - 1) Mend[i] = M_per_node;
   }
 
   for (int i = 0; i < ngpu; i++) {
