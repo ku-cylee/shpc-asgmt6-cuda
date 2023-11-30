@@ -59,14 +59,15 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
   int M_per_iter = M / ITERATION;
   int M_per_iter_node = M_per_iter / mpi_world_size;
 
+  MPI_Request scatter_req, gather_req;
+  MPI_Iscatter(
+    A, M_per_iter_node * K, MPI_FLOAT,
+    A, M_per_iter_node * K, MPI_FLOAT,
+    0, MPI_COMM_WORLD, &scatter_req);
   MPI_Bcast(B, K * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
   for (int iter = 0; iter < ITERATION; iter++) {
-
-    MPI_Scatter(
-      A + iter * M_per_iter * K, M_per_iter_node * K, MPI_FLOAT,
-      A + iter * M_per_iter * K, M_per_iter_node * K, MPI_FLOAT,
-      0, MPI_COMM_WORLD);
+    MPI_Wait(&scatter_req, MPI_STATUS_IGNORE);
 
     // Async memcpy H->D on each GPU
     for (int i = 0; i < ngpu; i++) {
@@ -78,6 +79,13 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
                                 cudaMemcpyHostToDevice, streams[i]));
     }
 
+    if (iter + 1 != ITERATION) {
+      MPI_Iscatter(
+        A + (iter + 1) * M_per_iter * K, M_per_iter_node * K, MPI_FLOAT,
+        A + (iter + 1) * M_per_iter * K, M_per_iter_node * K, MPI_FLOAT,
+        0, MPI_COMM_WORLD, &scatter_req);
+    }
+
     // Run kernels asynchronously on each GPU
     for (int i = 0; i < ngpu; i++) {
       CHECK_CUDA(cudaSetDevice(i));
@@ -86,6 +94,10 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
       matmul_kernel<<<gridDim, blockDim, 0, streams[i]>>>(
           A_gpu[i], B_gpu[i], C_gpu[i], Mend[iter][i] - Mbegin[iter][i], N, K);
       CHECK_CUDA(cudaGetLastError());
+    }
+
+    if (iter != 0) {
+      MPI_Wait(&gather_req, MPI_STATUS_IGNORE);
     }
 
     // Async memcpy D->H on each GPU
@@ -102,11 +114,15 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
       cudaStreamSynchronize(streams[i]);
     }
 
-    MPI_Gather(
+    MPI_Igather(
       C + iter * M_per_iter * N, M_per_iter_node * N, MPI_FLOAT,
       C + iter * M_per_iter * N, M_per_iter_node * N, MPI_FLOAT,
-      0, MPI_COMM_WORLD);
+      0, MPI_COMM_WORLD, &gather_req);
   }
+
+  MPI_Wait(&gather_req, MPI_STATUS_IGNORE);
+  // MPI_Request_free(&scatter_req);
+  // MPI_Request_free(&gather_req);
 }
 
 
