@@ -15,7 +15,7 @@
   } while (0)
 
 #define TILE_SIZE     32
-#define ITERATION     4
+#define ITERATION     16
 
 static int mpi_rank, mpi_world_size;
 
@@ -75,8 +75,10 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
       CHECK_CUDA(cudaMemcpyAsync(A_gpu[i], &A[Mbegin[iter][i] * K],
                                 (Mend[iter][i] - Mbegin[iter][i]) * K * sizeof(float),
                                 cudaMemcpyHostToDevice, streams[i]));
-      CHECK_CUDA(cudaMemcpyAsync(B_gpu[i], B, K * N * sizeof(float),
-                                cudaMemcpyHostToDevice, streams[i]));
+      if (iter == 0) {
+        CHECK_CUDA(cudaMemcpyAsync(B_gpu[i], B, K * N * sizeof(float),
+                                  cudaMemcpyHostToDevice, streams[i]));
+      }
     }
 
     if (iter + 1 != ITERATION) {
