@@ -59,39 +59,15 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
   int M_per_iter = M / ITERATION;
   int M_per_iter_node = M_per_iter / mpi_world_size;
 
+  MPI_Request scatter_req, gather_req;
+  MPI_Iscatter(
+    A, M_per_iter_node * K, MPI_FLOAT,
+    A, M_per_iter_node * K, MPI_FLOAT,
+    0, MPI_COMM_WORLD, &scatter_req);
   MPI_Bcast(B, K * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
-  int start = 0, sc = 0, h2d = 0, mm = 0, d2h = 0, gt = 0;
 
-  #pragma omp parallel num_threads(ITERATION)
-  {
-    int iter;
-
-    #pragma omp critical
-    {
-      iter = start;
-      start = iter + 1;
-    }
-
-    while (iter != 0) {
-      int flag;
-      #pragma omp atomic read
-      flag = h2d;
-      if (flag >= iter) break;
-    }
-
-    MPI_Scatter(
-      A + iter * M_per_iter * N, M_per_iter_node * K, MPI_FLOAT,
-      A + iter * M_per_iter * N, M_per_iter_node * K, MPI_FLOAT,
-      0, MPI_COMM_WORLD);
-
-    #pragma omp atomic write
-    sc = iter + 1;
-    while (iter != 0) {
-      int flag;
-      #pragma omp atomic read
-      flag = mm;
-      if (flag >= iter) break;
-    }
+  for (int iter = 0; iter < ITERATION; iter++) {
+    MPI_Wait(&scatter_req, MPI_STATUS_IGNORE);
 
     // Async memcpy H->D on each GPU
     for (int i = 0; i < ngpu; i++) {
@@ -105,19 +81,11 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
       }
     }
 
-    // Wait for all async jobs to finish
-    for (int i = 0; i < ngpu; i++) {
-      cudaSetDevice(i);
-      cudaStreamSynchronize(streams[i]);
-    }
-
-    #pragma omp atomic write
-    h2d = iter + 1;
-    while (iter != 0) {
-      int flag;
-      #pragma omp atomic read
-      flag = d2h;
-      if (flag >= iter) break;
+    if (iter + 1 != ITERATION) {
+      MPI_Iscatter(
+        A + (iter + 1) * M_per_iter * K, M_per_iter_node * K, MPI_FLOAT,
+        A + (iter + 1) * M_per_iter * K, M_per_iter_node * K, MPI_FLOAT,
+        0, MPI_COMM_WORLD, &scatter_req);
     }
 
     // Run kernels asynchronously on each GPU
@@ -130,19 +98,8 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
       CHECK_CUDA(cudaGetLastError());
     }
 
-    // Wait for all async jobs to finish
-    for (int i = 0; i < ngpu; i++) {
-      cudaSetDevice(i);
-      cudaStreamSynchronize(streams[i]);
-    }
-
-    #pragma omp atomic write
-    mm = iter + 1;
-    while (iter != 0) {
-      int flag;
-      #pragma omp atomic read
-      flag = gt;
-      if (flag >= iter) break;
+    if (iter != 0) {
+      MPI_Wait(&gather_req, MPI_STATUS_IGNORE);
     }
 
     // Async memcpy D->H on each GPU
@@ -159,17 +116,15 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
       cudaStreamSynchronize(streams[i]);
     }
 
-    #pragma omp atomic write
-    d2h = iter + 1;
-
-    MPI_Gather(
+    MPI_Igather(
       C + iter * M_per_iter * N, M_per_iter_node * N, MPI_FLOAT,
       C + iter * M_per_iter * N, M_per_iter_node * N, MPI_FLOAT,
-      0, MPI_COMM_WORLD);
-
-    #pragma omp atomic write
-    gt = iter + 1;
+      0, MPI_COMM_WORLD, &gather_req);
   }
+
+  MPI_Wait(&gather_req, MPI_STATUS_IGNORE);
+  // MPI_Request_free(&scatter_req);
+  // MPI_Request_free(&gather_req);
 }
 
 
@@ -192,7 +147,7 @@ void matmul_initialize(int M, int N, int K) {
 
   for (int iter = 0; iter < ITERATION; iter++) {
     for (int i = 0; i < ngpu; i++) {
-      Mbegin[iter][i] = iter * M_per_iter + i * M_per_gpu;
+      Mbegin[iter][i] = iter * M_per_iter + M_per_gpu * i;
       Mend[iter][i] = Mbegin[iter][i] + M_per_gpu;
       // if (i == ngpu - 1) Mend[iter][i] = M_per_node;
     }
