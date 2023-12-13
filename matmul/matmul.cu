@@ -60,11 +60,18 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
   int M_per_iter_node = M_per_iter / mpi_world_size;
 
   MPI_Request scatter_req, gather_req;
+  
+  MPI_Bcast(B, K * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
+  for (int i = 0; i < ngpu; i++) {
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaMemcpyAsync(B_gpu[i], B, K * N * sizeof(float),
+                              cudaMemcpyHostToDevice, streams[i]));
+  }
+
   MPI_Iscatter(
     A, M_per_iter_node * K, MPI_FLOAT,
     A, M_per_iter_node * K, MPI_FLOAT,
     0, MPI_COMM_WORLD, &scatter_req);
-  MPI_Bcast(B, K * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
   for (int iter = 0; iter < ITERATION; iter++) {
     MPI_Wait(&scatter_req, MPI_STATUS_IGNORE);
@@ -75,10 +82,6 @@ void matmul(float *A, float *B, float *C, int M, int N, int K) {
       CHECK_CUDA(cudaMemcpyAsync(A_gpu[i], &A[Mbegin[iter][i] * K],
                                 (Mend[iter][i] - Mbegin[iter][i]) * K * sizeof(float),
                                 cudaMemcpyHostToDevice, streams[i]));
-      if (iter == 0) {
-        CHECK_CUDA(cudaMemcpyAsync(B_gpu[i], B, K * N * sizeof(float),
-                                  cudaMemcpyHostToDevice, streams[i]));
-      }
     }
 
     if (iter + 1 != ITERATION) {
