@@ -14,7 +14,8 @@
     }                                                                 \
   } while (0)
 
-#define TILE_SIZE     32
+#define GPU_THREADS   32
+#define NUM_CYCLES    16
 
 static int mpi_rank, mpi_world_size;
 
@@ -23,20 +24,20 @@ static __global__ void matmul_kernel(float *A, float *B, float *C, int M, int N,
   int local_row = threadIdx.y;
   int local_col = threadIdx.x;
 
-  int global_row = TILE_SIZE * blockIdx.y + local_row;
-  int global_col = TILE_SIZE * blockIdx.x + local_col;
+  int global_row = GPU_THREADS * blockIdx.y + local_row;
+  int global_col = GPU_THREADS * blockIdx.x + local_col;
 
-  __shared__ float A_tile[TILE_SIZE][TILE_SIZE];
-  __shared__ float B_tile[TILE_SIZE][TILE_SIZE];
+  __shared__ float A_tile[GPU_THREADS][GPU_THREADS];
+  __shared__ float B_tile[GPU_THREADS][GPU_THREADS];
 
   float sum = 0.0f;
-  for (int k = 0; k < K; k += TILE_SIZE) {
+  for (int k = 0; k < K; k += GPU_THREADS) {
     A_tile[local_row][local_col] = A[global_row * K + local_col + k];
     B_tile[local_row][local_col] = B[(local_row + k) * N + global_col];
 
     __syncthreads();
 
-    for (int t = 0; t < TILE_SIZE; t++) {
+    for (int t = 0; t < GPU_THREADS; t++) {
       sum += A_tile[local_row][t] * B_tile[t][local_col];
     }
 
@@ -48,44 +49,84 @@ static __global__ void matmul_kernel(float *A, float *B, float *C, int M, int N,
 
 #define NGPU 4
 
-static int Mbegin, Mend;
-static int ngpu;
+static int Mbegin[NUM_CYCLES][NGPU], Mend[NUM_CYCLES][NGPU];
 static cudaStream_t stream;
 static float *A_gpu, *B_gpu, *C_gpu;
 
-
 void matmul(float *A, float *B, float *C, int M, int N, int K) {
 
-  int M_per_node = M / mpi_world_size;
+  int M_per_cycle = M / NUM_CYCLES;
+  int M_per_cycle_node = M_per_cycle / mpi_world_size;
 
-  MPI_Scatter(
-    A, M_per_node * K, MPI_FLOAT,
-    A, M_per_node * K, MPI_FLOAT,
-    0, MPI_COMM_WORLD);
+  MPI_Request scatter_req, gather_req;
+  
   MPI_Bcast(B, K * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
+  for (int i = 0; i < ngpu; i++) {
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaMemcpyAsync(B_gpu[i], B, K * N * sizeof(float),
+                              cudaMemcpyHostToDevice, streams[i]));
+  }
 
-  CHECK_CUDA(cudaMemcpyAsync(A_gpu, &A[Mbegin * K],
-                              (Mend - Mbegin) * K * sizeof(float),
-                              cudaMemcpyHostToDevice, stream));
-  CHECK_CUDA(cudaMemcpyAsync(B_gpu, B, K * N * sizeof(float),
-                              cudaMemcpyHostToDevice, stream));
+  MPI_Iscatter(
+    A, M_per_cycle_node * K, MPI_FLOAT,
+    A, M_per_cycle_node * K, MPI_FLOAT,
+    0, MPI_COMM_WORLD, &scatter_req);
 
-  dim3 blockDim(TILE_SIZE, TILE_SIZE);
-  dim3 gridDim((N + TILE_SIZE - 1) / TILE_SIZE, (Mend - Mbegin + TILE_SIZE - 1) / TILE_SIZE);
-  matmul_kernel<<<gridDim, blockDim, 0, stream>>>(
-      A_gpu, B_gpu, C_gpu, Mend - Mbegin, N, K);
-  CHECK_CUDA(cudaGetLastError());
+  for (int cycle = 0; cycle < NUM_CYCLES; cycle++) {
+    MPI_Wait(&scatter_req, MPI_STATUS_IGNORE);
 
-  CHECK_CUDA(cudaMemcpyAsync(&C[Mbegin * N], C_gpu,
-                              (Mend - Mbegin) * N * sizeof(float),
-                              cudaMemcpyDeviceToHost, stream));
+    // Async memcpy H->D on each GPU
+    for (int i = 0; i < ngpu; i++) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaMemcpyAsync(A_gpu[i], &A[Mbegin[cycle][i] * K],
+                                (Mend[cycle][i] - Mbegin[cycle][i]) * K * sizeof(float),
+                                cudaMemcpyHostToDevice, streams[i]));
+    }
 
-  cudaStreamSynchronize(stream);
+    if (cycle + 1 != NUM_CYCLES) {
+      MPI_Iscatter(
+        A + (cycle + 1) * M_per_cycle * K, M_per_cycle_node * K, MPI_FLOAT,
+        A + (cycle + 1) * M_per_cycle * K, M_per_cycle_node * K, MPI_FLOAT,
+        0, MPI_COMM_WORLD, &scatter_req);
+    }
 
-  MPI_Gather(
-    C, M_per_node * N, MPI_FLOAT,
-    C, M_per_node * N, MPI_FLOAT,
-    0, MPI_COMM_WORLD);
+    // Run kernels asynchronously on each GPU
+    for (int i = 0; i < ngpu; i++) {
+      CHECK_CUDA(cudaSetDevice(i));
+      dim3 blockDim(GPU_THREADS, GPU_THREADS);
+      dim3 gridDim((N + GPU_THREADS - 1) / GPU_THREADS, (Mend[cycle][i] - Mbegin[cycle][i] + GPU_THREADS - 1) / GPU_THREADS);
+      matmul_kernel<<<gridDim, blockDim, 0, streams[i]>>>(
+          A_gpu[i], B_gpu[i], C_gpu[i], Mend[cycle][i] - Mbegin[cycle][i], N, K);
+      CHECK_CUDA(cudaGetLastError());
+    }
+
+    if (cycle != 0) {
+      MPI_Wait(&gather_req, MPI_STATUS_IGNORE);
+    }
+
+    // Async memcpy D->H on each GPU
+    for (int i = 0; i < ngpu; i++) {
+      CHECK_CUDA(cudaSetDevice(i));
+      CHECK_CUDA(cudaMemcpyAsync(&C[Mbegin[cycle][i] * N], C_gpu[i],
+                                (Mend[cycle][i] - Mbegin[cycle][i]) * N * sizeof(float),
+                                cudaMemcpyDeviceToHost, streams[i]));
+    }
+
+    // Wait for all async jobs to finish
+    for (int i = 0; i < ngpu; i++) {
+      cudaSetDevice(i);
+      cudaStreamSynchronize(streams[i]);
+    }
+
+    MPI_Igather(
+      C + cycle * M_per_cycle * N, M_per_cycle_node * N, MPI_FLOAT,
+      C + cycle * M_per_cycle * N, M_per_cycle_node * N, MPI_FLOAT,
+      0, MPI_COMM_WORLD, &gather_req);
+  }
+
+  MPI_Wait(&gather_req, MPI_STATUS_IGNORE);
+  // MPI_Request_free(&scatter_req);
+  // MPI_Request_free(&gather_req);
 }
 
 
@@ -101,19 +142,28 @@ void matmul_initialize(int M, int N, int K) {
   CHECK_CUDA(cudaGetDeviceProperties(&prop, gpu_id));
   printf("[rank %d] device %d: %s\n", mpi_rank, gpu_id, prop.name);
 
-  int M_per_node = M / mpi_world_size;
+  int M_per_cycle = M / NUM_CYCLES;
+  int M_per_node = M_per_cycle / mpi_world_size;
+  int M_per_gpu = M_per_node / ngpu;
 
-  Mbegin = 0;
-  Mend = M_per_node;
+  for (int cycle = 0; cycle < NUM_CYCLES; cycle++) {
+    for (int i = 0; i < ngpu; i++) {
+      Mbegin[cycle][i] = cycle * M_per_cycle + M_per_gpu * i;
+      Mend[cycle][i] = Mbegin[cycle][i] + M_per_gpu;
+      // if (i == ngpu - 1) Mend[cycle][i] = M_per_node;
+    }
+  }
 
   CHECK_CUDA(cudaSetDevice(gpu_id));
   CHECK_CUDA(cudaStreamCreate(&stream));
-
-  CHECK_CUDA(
-      cudaMalloc(&A_gpu, (Mend - Mbegin) * K * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&B_gpu, K * N * sizeof(float)));
-  CHECK_CUDA(
-      cudaMalloc(&C_gpu, (Mend - Mbegin) * N * sizeof(float)));
+  for (int i = 0; i < ngpu; i++) {
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(
+        cudaMalloc(&A_gpu[i], M_per_gpu * K * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&B_gpu[i], K * N * sizeof(float)));
+    CHECK_CUDA(
+        cudaMalloc(&C_gpu[i], M_per_gpu * N * sizeof(float)));
+  }
 }
 
 
