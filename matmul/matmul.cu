@@ -50,9 +50,8 @@ static __global__ void matmul_kernel(float *A, float *B, float *C, int M, int N,
 #define NGPU 4
 
 static int Mbegin[NUM_CYCLES][NGPU], Mend[NUM_CYCLES][NGPU];
-static int ngpu;
-static cudaStream_t streams[NGPU];
-static float *A_gpu[NGPU], *B_gpu[NGPU], *C_gpu[NGPU];
+static cudaStream_t stream;
+static float *A_gpu, *B_gpu, *C_gpu;
 
 void matmul(float *A, float *B, float *C, int M, int N, int K) {
 
@@ -137,12 +136,11 @@ void matmul_initialize(int M, int N, int K) {
 
   CHECK_CUDA(cudaGetDeviceCount(&ngpu));
 
+  int gpu_id = mpi_rank % ngpu;
   printf("[rank %d] Number of devices: %d\n", mpi_rank, ngpu);
-  cudaDeviceProp props[NGPU];
-  for (int i = 0; i < ngpu; ++i) {
-    CHECK_CUDA(cudaGetDeviceProperties(&props[i], i));
-    printf("[rank %d] device %d: %s\n", mpi_rank, i, props[i].name);
-  }
+  cudaDeviceProp prop;
+  CHECK_CUDA(cudaGetDeviceProperties(&prop, gpu_id));
+  printf("[rank %d] device %d: %s\n", mpi_rank, gpu_id, prop.name);
 
   int M_per_cycle = M / NUM_CYCLES;
   int M_per_node = M_per_cycle / mpi_world_size;
@@ -156,11 +154,8 @@ void matmul_initialize(int M, int N, int K) {
     }
   }
 
-  for (int i = 0; i < ngpu; i++) {
-    CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaStreamCreate(&streams[i]));
-  }
-
+  CHECK_CUDA(cudaSetDevice(gpu_id));
+  CHECK_CUDA(cudaStreamCreate(&stream));
   for (int i = 0; i < ngpu; i++) {
     CHECK_CUDA(cudaSetDevice(i));
     CHECK_CUDA(
@@ -173,11 +168,8 @@ void matmul_initialize(int M, int N, int K) {
 
 
 void matmul_finalize() {
-  for (int i = 0; i < ngpu; i++) {
-    CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaFree(A_gpu[i]));
-    CHECK_CUDA(cudaFree(B_gpu[i]));
-    CHECK_CUDA(cudaFree(C_gpu[i]));
-    CHECK_CUDA(cudaStreamDestroy(streams[i]));
-  }
+  CHECK_CUDA(cudaFree(A_gpu));
+  CHECK_CUDA(cudaFree(B_gpu));
+  CHECK_CUDA(cudaFree(C_gpu));
+  CHECK_CUDA(cudaStreamDestroy(stream));
 }
